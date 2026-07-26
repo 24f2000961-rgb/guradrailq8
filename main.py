@@ -182,7 +182,7 @@ def validate_path(user_path):
     # filesystem -- this is what keeps the benign encoded/backslash-ish
     # filenames resolvable while still blocking real traversal above.
     normalized_input = _confusables_folded(
-    unicodedata.normalize("NFKC", user_path)
+        unicodedata.normalize("NFKC", user_path)
     ).replace("\\", "/")
 
     normalized_raw = os.path.normpath(normalized_input)
