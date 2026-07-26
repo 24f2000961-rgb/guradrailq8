@@ -319,6 +319,14 @@ def validate_url(url):
         return None, "missing host"
 
     host = host.lower().rstrip(".")
+    try:
+      ipaddress.ip_address(host)
+      return None, "IP literals not allowed"
+    except ValueError:
+      pass
+
+    if port not in (None, 443):
+    return None, "port not allowed"
     if host not in ALLOWED_HOSTS:
         return None, f"host not allowlisted: {host}"
 
