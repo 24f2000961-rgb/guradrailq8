@@ -257,6 +257,14 @@ def validate_url(url):
     if not isinstance(url, str) or url == "":
         return None, "url must be a non-empty string"
 
+    # Reject control characters (including CR/LF) anywhere in the entire
+    # URL, not just the authority. A URL containing a raw or literal CR/LF
+    # could be used to attempt HTTP request-splitting/header-injection
+    # once we hand the string to the underlying HTTP client, independent
+    # of whether the host itself is allowlisted.
+    if any(ord(c) < 0x21 or ord(c) == 0x7F for c in url):
+        return None, "control character in url is not allowed"
+
     try:
         parts = urlsplit(url)
     except ValueError:
@@ -323,7 +331,18 @@ def validate_url(url):
             return None, f"resolved address is private/reserved: {ip_str}"
 
     rebuilt = parts._replace(netloc=host + (f":{port}" if port else ""))
-    return rebuilt.geturl(), None
+    rebuilt_url = rebuilt.geturl()
+
+    # Self-consistency guard: re-parse what we're about to actually fetch
+    # and confirm its hostname is still exactly the validated one. Cheap
+    # insurance against any edge case in geturl()/_replace() reconstruction
+    # itself introducing drift between "what we validated" and "what we
+    # fetch".
+    recheck = urlsplit(rebuilt_url)
+    if (recheck.hostname or "").lower().rstrip(".") != host:
+        return None, "reconstructed url host mismatch"
+
+    return rebuilt_url, None
 
 
 def do_fetch_url(url):
