@@ -126,6 +126,24 @@ def _looks_like_traversal(candidate_str):
     return False
 
 
+# Unicode characters that visually or semantically resemble '/' or '.' and
+# have historically been used to slip traversal payloads past filters that
+# only check ASCII '/' and '.'. NFKC handles some of these (e.g. fullwidth
+# U+FF0F, U+FF0E) automatically, but not all -- division slash (U+2215),
+# fraction slash (U+2044), one-dot-leader (U+2024), small full stop
+# (U+FE52) are compatibility-equivalent in *meaning* but not folded by
+# NFKC, so map them explicitly before normalizing.
+_CONFUSABLE_SLASHES = "\u2215\u2044\uFF0F"
+_CONFUSABLE_DOTS = "\u2024\uFE52\u3002\uFF0E"
+_CONFUSABLE_TABLE = str.maketrans(
+    {c: "/" for c in _CONFUSABLE_SLASHES} | {c: "." for c in _CONFUSABLE_DOTS}
+)
+
+
+def _confusables_folded(s):
+    return s.translate(_CONFUSABLE_TABLE)
+
+
 def validate_path(user_path):
     if not isinstance(user_path, str) or user_path == "":
         return None, "path must be a non-empty string"
@@ -151,6 +169,9 @@ def validate_path(user_path):
         "raw-backslash-normalized": user_path.replace("\\", "/"),
         "decoded-backslash-normalized": decoded.replace("\\", "/"),
         "nfkc": unicodedata.normalize("NFKC", decoded).replace("\\", "/"),
+        "confusables-folded": _confusables_folded(
+            unicodedata.normalize("NFKC", decoded)
+        ).replace("\\", "/"),
     }
 
     for label, view in views.items():
@@ -260,22 +281,26 @@ def validate_url(url):
     if any(ord(c) < 0x21 or ord(c) == 0x7F for c in parts.netloc):
         return None, "control character in authority is not allowed"
 
-    # FIX: .username / .password / .hostname / .port are lazily-parsed
-    # properties on SplitResult and can *each* raise ValueError on
-    # malformed input (e.g. bad IPv6 literal, out-of-range port). The
-    # original code only guarded the urlsplit() call itself, so a
-    # malformed-but-scheme-valid URL could crash the endpoint with an
-    # unhandled 500 instead of returning a clean "block". Guard all of it.
+    # FIX: parts.username / parts.password are '' or None for a URL like
+    # "https://@www.iana.org/" (userinfo marker present but empty) -- both
+    # are FALSY, so `if username or password` silently passed this through
+    # even though it structurally contains userinfo syntax. Check for the
+    # literal '@' in the authority directly instead, which is unambiguous
+    # regardless of how urlsplit represents an empty username/password.
+    if "@" in parts.netloc:
+        return None, "userinfo in url is not allowed"
+
+    # .hostname / .port are lazily-parsed properties on SplitResult and
+    # can *each* raise ValueError on malformed input (e.g. bad IPv6
+    # literal, out-of-range port). The original code only guarded the
+    # urlsplit() call itself, so a malformed-but-scheme-valid URL could
+    # crash the endpoint with an unhandled 500 instead of returning a
+    # clean "block". Guard all of it.
     try:
-        username = parts.username
-        password = parts.password
         host = parts.hostname
         port = parts.port
     except ValueError as e:
         return None, f"unparseable url component: {e}"
-
-    if username or password:
-        return None, "userinfo in url is not allowed"
 
     if not host:
         return None, "missing host"
