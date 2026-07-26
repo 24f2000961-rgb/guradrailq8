@@ -74,12 +74,24 @@ SEED_FILES = {
 }
 
 
+import sys
+
+
 def seed_files():
     for path, content in SEED_FILES.items():
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        if not os.path.exists(path):
-            with open(path, "w") as f:
-                f.write(content)
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            if not os.path.exists(path):
+                with open(path, "w") as f:
+                    f.write(content)
+        except OSError as e:
+            # Don't let a permissions problem on the host (e.g. /srv owned by
+            # root, app running as an unprivileged user) take the whole
+            # server down. Log it loudly instead -- if this fires, the
+            # required files must be created some other way (see README /
+            # deploy notes: a build-time step that runs with more
+            # privileges, or a writable bind mount).
+            print(f"WARNING: could not seed {path!r}: {e}", file=sys.stderr)
 
 
 seed_files()
