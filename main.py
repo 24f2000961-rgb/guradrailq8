@@ -321,7 +321,7 @@ def validate_url(url):
     host = host.lower().rstrip(".")
 
     try:
-      ipaddress.ip_address(host)
+        ipaddress.ip_address(host)
         return None, "IP literals not allowed"
     except ValueError:
         pass
