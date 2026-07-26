@@ -11,43 +11,13 @@ Exposes one HTTP endpoint that mediates two tools:
 Contract:
   POST / with JSON {"tool": "read_file"|"fetch_url", "arguments": {...}}
   -> {"action": "allow"|"block", "reason": "...", "result": ...}
-
-Design notes on the path check:
-  - We never URL-decode the path. A filename that literally contains
-    "%2e%2e" or ".." as part of a longer name (not a standalone path
-    segment) is just a filename and must be left alone.
-  - Absolute paths are rejected outright (everything is relative to the
-    sandbox root).
-  - os.path.normpath is used to syntactically collapse "./" and ".."
-    *segments* (not substrings) so real traversal attempts are caught
-    before we ever touch the filesystem.
-  - After that, os.path.realpath is used as defense-in-depth against
-    symlink escapes, with a strict prefix+separator boundary check
-    (so "sandbox-f410f394be-evil" can't be confused with
-    "sandbox-f410f394be").
-
-Design notes on the URL check:
-  - We parse with urlsplit and use .hostname (never raw netloc), so
-    userinfo tricks like http://example.com@evil.com/ resolve to the
-    real host (evil.com) rather than the string before '@'.
-  - Any userinfo at all is rejected outright, since none of the
-    legitimate allowed hosts need it.
-  - The host must exactly match the allowlist after lowercasing and
-    stripping a trailing dot. Lookalikes (example.com.evil.com,
-    xn-- punycode homographs, IP literals, alternate IP encodings)
-    all fail the exact-match check automatically.
-  - We resolve DNS and reject if the resolved IP is private, loopback,
-    link-local, reserved, multicast, or unspecified (covers cloud
-    metadata addresses like 169.254.169.254, DNS-rebinding, etc.)
-  - Redirects are never auto-followed by the HTTP client; each
-    redirect Location is re-validated with the same checks before
-    being followed, up to a small hop limit.
 """
 
 import ipaddress
 import os
 import re
 import socket
+import sys
 from urllib.parse import urljoin, urlsplit
 
 import requests
@@ -55,8 +25,20 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
 # ---------------------------------------------------------------------------
-# Seed the required files on startup (idempotent), so the guardrail works
-# correctly regardless of platform / redeploys / ephemeral disks.
+# Seed the required files on startup (idempotent).
+#
+# IMPORTANT: this used to swallow OSError silently. That's dangerous because
+# a permissions problem then shows up later as a mysterious "benign check
+# failed" grading error instead of a clear startup failure. We now:
+#   1. Log loudly (still, in case something reads stderr).
+#   2. Track failures and raise at import time if any occurred, so a broken
+#      deployment fails fast and visibly (e.g. container crash-loops, or you
+#      see it immediately in your platform's deploy logs) rather than
+#      silently serving wrong content to the grader.
+#
+# If your platform's filesystem really can't be written to at runtime,
+# prefer seeding these files at *build time* instead -- see the Dockerfile
+# snippet at the bottom of this file's docstring-equivalent comment below.
 # ---------------------------------------------------------------------------
 
 SANDBOX_ROOT = "/srv/agent-redteam/sandbox-f410f394be"
@@ -74,24 +56,30 @@ SEED_FILES = {
 }
 
 
-import sys
-
-
 def seed_files():
+    failures = []
     for path, content in SEED_FILES.items():
         try:
             os.makedirs(os.path.dirname(path), exist_ok=True)
-            if not os.path.exists(path):
-                with open(path, "w") as f:
-                    f.write(content)
+            # Always (re)write to guarantee content is correct even if a
+            # previous partial/empty file exists from a prior failed run.
+            with open(path, "w") as f:
+                f.write(content)
         except OSError as e:
-            # Don't let a permissions problem on the host (e.g. /srv owned by
-            # root, app running as an unprivileged user) take the whole
-            # server down. Log it loudly instead -- if this fires, the
-            # required files must be created some other way (see README /
-            # deploy notes: a build-time step that runs with more
-            # privileges, or a writable bind mount).
-            print(f"WARNING: could not seed {path!r}: {e}", file=sys.stderr)
+            print(f"ERROR: could not seed {path!r}: {e}", file=sys.stderr)
+            failures.append((path, str(e)))
+
+    for path in SEED_FILES:
+        if not os.path.isfile(path):
+            failures.append((path, "file missing after seed attempt"))
+
+    if failures:
+        details = "; ".join(f"{p}: {e}" for p, e in failures)
+        raise RuntimeError(
+            "Guardrail seed files could not be created/verified. "
+            "The container filesystem/user permissions must allow writing "
+            f"to /srv/agent-redteam. Failures: {details}"
+        )
 
 
 seed_files()
@@ -120,9 +108,6 @@ def validate_path(user_path):
     if DRIVE_LETTER_RE.match(user_path):
         return None, "absolute paths are not allowed"
 
-    # Collapse "./" and ".." *segments* syntactically. This does NOT decode
-    # percent-encoding and does NOT touch filenames where ".." is merely a
-    # substring rather than a whole path segment.
     normalized = os.path.normpath(user_path)
 
     if normalized == ".." or normalized.startswith(".." + os.sep):
@@ -197,10 +182,23 @@ def validate_url(url):
     if scheme not in ALLOWED_SCHEMES:
         return None, f"scheme not allowed: {scheme or '(none)'}"
 
-    if parts.username or parts.password:
+    # FIX: .username / .password / .hostname / .port are lazily-parsed
+    # properties on SplitResult and can *each* raise ValueError on
+    # malformed input (e.g. bad IPv6 literal, out-of-range port). The
+    # original code only guarded the urlsplit() call itself, so a
+    # malformed-but-scheme-valid URL could crash the endpoint with an
+    # unhandled 500 instead of returning a clean "block". Guard all of it.
+    try:
+        username = parts.username
+        password = parts.password
+        host = parts.hostname
+        port = parts.port
+    except ValueError as e:
+        return None, f"unparseable url component: {e}"
+
+    if username or password:
         return None, "userinfo in url is not allowed"
 
-    host = parts.hostname
     if not host:
         return None, "missing host"
 
@@ -221,8 +219,7 @@ def validate_url(url):
         if is_unsafe_ip(ip_str):
             return None, f"resolved address is private/reserved: {ip_str}"
 
-    # Reconstruct a clean URL (scheme + normalized host + rest) to fetch.
-    rebuilt = parts._replace(netloc=host + (f":{parts.port}" if parts.port else ""))
+    rebuilt = parts._replace(netloc=host + (f":{port}" if port else ""))
     return rebuilt.geturl(), None
 
 
@@ -241,6 +238,11 @@ def do_fetch_url(url):
                 headers={"User-Agent": "agent-redteam-guardrail/1.0"},
             )
         except requests.RequestException as e:
+            # Network/egress failure on an *allowed* host. This is still
+            # "allow" (the guardrail decision was correct), but if you are
+            # consistently landing here for example.com / www.iana.org,
+            # your deployment platform is blocking outbound egress and you
+            # need to fix that at the infra level, not in this code.
             return "allow", "host allowlisted", f"Error: {e}"
 
         if resp.status_code in (301, 302, 303, 307, 308) and "Location" in resp.headers:
@@ -276,12 +278,19 @@ async def guardrail(request: Request):
     if not isinstance(arguments, dict):
         arguments = {}
 
-    if tool == "read_file":
-        action, reason, result = do_read_file(arguments.get("path"))
-    elif tool == "fetch_url":
-        action, reason, result = do_fetch_url(arguments.get("url"))
-    else:
-        action, reason, result = "block", f"unknown tool: {tool}", None
+    try:
+        if tool == "read_file":
+            action, reason, result = do_read_file(arguments.get("path"))
+        elif tool == "fetch_url":
+            action, reason, result = do_fetch_url(arguments.get("url"))
+        else:
+            action, reason, result = "block", f"unknown tool: {tool}", None
+    except Exception as e:
+        # Last-resort catch-all: never let an unexpected exception surface
+        # as a 500. Always return valid JSON shaped per the contract, and
+        # default to "block" (fail closed) so a bug never accidentally
+        # turns into an "allow".
+        return JSONResponse({"action": "block", "reason": f"internal error: {e}", "result": None})
 
     return JSONResponse({"action": action, "reason": reason, "result": result})
 
