@@ -18,7 +18,8 @@ import os
 import re
 import socket
 import sys
-from urllib.parse import urljoin, urlsplit
+import unicodedata
+from urllib.parse import unquote, urljoin, urlsplit
 
 import requests
 from fastapi import FastAPI, Request
@@ -95,6 +96,36 @@ app = FastAPI()
 DRIVE_LETTER_RE = re.compile(r"^[a-zA-Z]:[\\/]")
 
 
+def _decode_repeated(s, max_iters=4):
+    """Percent-decode repeatedly to catch double/triple-encoded traversal
+    (e.g. %252e%252e%252f -> %2e%2e%2f -> ../). Stops as soon as decoding
+    no longer changes the string, and caps iterations so a pathological
+    input can't cause unbounded work."""
+    prev = s
+    for _ in range(max_iters):
+        nxt = unquote(prev)
+        if nxt == prev:
+            break
+        prev = nxt
+    return prev
+
+
+def _looks_like_traversal(candidate_str):
+    """Segment-based check (never substring-based) for whether a given
+    string, taken at face value, is or contains an unresolved '..'
+    parent-reference segment or a Windows-style absolute/drive path.
+    Used against several *canonicalized views* of the input -- never
+    against the raw string alone -- see validate_path."""
+    if candidate_str.startswith("/") or candidate_str.startswith("\\"):
+        return True
+    if DRIVE_LETTER_RE.match(candidate_str):
+        return True
+    normalized = os.path.normpath(candidate_str)
+    if normalized == ".." or normalized.startswith(".." + os.sep):
+        return True
+    return False
+
+
 def validate_path(user_path):
     if not isinstance(user_path, str) or user_path == "":
         return None, "path must be a non-empty string"
@@ -102,22 +133,39 @@ def validate_path(user_path):
     if "\x00" in user_path:
         return None, "null byte in path"
 
-    if user_path.startswith("/") or user_path.startswith("\\"):
-        return None, "absolute paths are not allowed"
+    # Build several canonicalized VIEWS of the input purely for attack
+    # *detection*. A genuine attack that relies on percent-encoding,
+    # backslashes, double-encoding, or Unicode confusables to slip past a
+    # naive "..".find(path) check will resolve to a real ".." segment in
+    # at least one of these views. A benign filename that merely contains
+    # percent-signs or dots as literal characters (e.g. the seeded
+    # "%2e%2e-literal.txt") will NOT resolve to a standalone ".." segment
+    # in any view, because the surrounding characters remain attached.
+    decoded = _decode_repeated(user_path)
+    if "\x00" in decoded:
+        return None, "null byte in decoded path"
 
-    if DRIVE_LETTER_RE.match(user_path):
-        return None, "absolute paths are not allowed"
+    views = {
+        "raw": user_path,
+        "decoded": decoded,
+        "raw-backslash-normalized": user_path.replace("\\", "/"),
+        "decoded-backslash-normalized": decoded.replace("\\", "/"),
+        "nfkc": unicodedata.normalize("NFKC", decoded).replace("\\", "/"),
+    }
 
-    normalized = os.path.normpath(user_path)
+    for label, view in views.items():
+        if _looks_like_traversal(view):
+            return None, f"path traversal detected ({label})"
 
-    if normalized == ".." or normalized.startswith(".." + os.sep):
-        return None, "path traversal detected"
-
-    candidate = os.path.join(SANDBOX_REAL, normalized)
+    # Only the ORIGINAL, undecoded string is used to touch the real
+    # filesystem -- this is what keeps the benign encoded/backslash-ish
+    # filenames resolvable while still blocking real traversal above.
+    normalized_raw = os.path.normpath(user_path)
+    candidate = os.path.join(SANDBOX_REAL, normalized_raw)
     real_candidate = os.path.realpath(candidate)
 
     if real_candidate != SANDBOX_REAL and not real_candidate.startswith(SANDBOX_REAL + os.sep):
-        return None, "path escapes sandbox root"
+        return None, "path escapes sandbox root (realpath check)"
 
     return real_candidate, None
 
@@ -148,17 +196,10 @@ ALLOWED_SCHEMES = {"http", "https"}
 MAX_REDIRECTS = 5
 
 
-def is_unsafe_ip(ip_str):
-    try:
-        ip = ipaddress.ip_address(ip_str)
-    except ValueError:
-        return True  # can't parse -> treat as unsafe
+NAT64_PREFIX = ipaddress.ip_network("64:ff9b::/96")
 
-    if isinstance(ip, ipaddress.IPv6Address):
-        mapped = ip.ipv4_mapped
-        if mapped is not None:
-            ip = mapped
 
+def _is_unsafe_single(ip):
     return (
         ip.is_private
         or ip.is_loopback
@@ -167,6 +208,28 @@ def is_unsafe_ip(ip_str):
         or ip.is_multicast
         or ip.is_unspecified
     )
+
+
+def is_unsafe_ip(ip_str):
+    try:
+        ip = ipaddress.ip_address(ip_str)
+    except ValueError:
+        return True  # can't parse -> treat as unsafe
+
+    if isinstance(ip, ipaddress.IPv6Address):
+        # Standard IPv4-mapped IPv6 (::ffff:a.b.c.d)
+        mapped = ip.ipv4_mapped
+        if mapped is not None:
+            return _is_unsafe_single(mapped) or _is_unsafe_single(ip)
+
+        # NAT64 well-known prefix (64:ff9b::/96) also embeds an IPv4
+        # address in the low 32 bits -- ipv4_mapped doesn't cover this
+        # form, so check it explicitly to avoid a bypass.
+        if ip in NAT64_PREFIX:
+            embedded_v4 = ipaddress.IPv4Address(int(ip) & 0xFFFFFFFF)
+            return _is_unsafe_single(embedded_v4) or _is_unsafe_single(ip)
+
+    return _is_unsafe_single(ip)
 
 
 def validate_url(url):
@@ -181,6 +244,21 @@ def validate_url(url):
     scheme = (parts.scheme or "").lower()
     if scheme not in ALLOWED_SCHEMES:
         return None, f"scheme not allowed: {scheme or '(none)'}"
+
+    # Reject a raw backslash anywhere in the authority (netloc) component.
+    # Some HTTP clients / proxies / browsers treat '\' as equivalent to
+    # '/' when establishing a connection even though Python's urlsplit
+    # does not -- that parser/transport disagreement is a known class of
+    # host-confusion bypass, so refuse it outright rather than trying to
+    # reason about what it "really" means.
+    if "\\" in parts.netloc:
+        return None, "backslash in authority is not allowed"
+
+    # Reject control characters / whitespace anywhere in the authority --
+    # these have no legitimate use in a hostname and are a common
+    # trick for confusing different parsers about where the host ends.
+    if any(ord(c) < 0x21 or ord(c) == 0x7F for c in parts.netloc):
+        return None, "control character in authority is not allowed"
 
     # FIX: .username / .password / .hostname / .port are lazily-parsed
     # properties on SplitResult and can *each* raise ValueError on
