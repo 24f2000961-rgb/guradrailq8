@@ -213,7 +213,7 @@ def do_read_file(path):
 # ---------------------------------------------------------------------------
 
 ALLOWED_HOSTS = {"example.com", "www.iana.org"}
-ALLOWED_SCHEMES = {"http", "https"}
+ALLOWED_SCHEMES = {"https"}
 MAX_REDIRECTS = 5
 
 
