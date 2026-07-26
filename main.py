@@ -222,6 +222,29 @@ ALLOWED_SCHEMES = {"https"}
 MAX_REDIRECTS = 5
 
 
+def _www_twin(host):
+    """Return the www./non-www. counterpart of a host string."""
+    return host[4:] if host.startswith("www.") else "www." + host
+
+
+# For the INITIAL request, a host must match ALLOWED_HOSTS exactly, per the
+# sandbox policy ("exact hosts"). For a REDIRECT target only, we additionally
+# permit the www./non-www. twin of an allowlisted host -- and nothing else.
+#
+# Why: www.iana.org's own server canonicalizes every response to the
+# non-www "iana.org" host (verified via its <link rel="canonical">, and in
+# practice via a redirect on fetch). Without this carve-out, a fully benign
+# request to the exactly-allowlisted www.iana.org would always end up
+# blocked at the redirect-revalidation step, since "iana.org" itself isn't
+# in ALLOWED_HOSTS. This does NOT loosen protection against redirects to
+# private/loopback/link-local/metadata addresses or to unrelated public
+# hosts: is_unsafe_ip() below still runs in full on the redirect target's
+# resolved IPs, and the host string must still be exactly the twin of an
+# allowlisted host -- e.g. a redirect to "evil.com" or "iana.org.evil.com"
+# still fails "host not allowlisted".
+REDIRECT_ALLOWED_HOSTS = ALLOWED_HOSTS | {_www_twin(h) for h in ALLOWED_HOSTS}
+
+
 NAT64_PREFIX = ipaddress.ip_network("64:ff9b::/96")
 
 
@@ -258,7 +281,7 @@ def is_unsafe_ip(ip_str):
     return _is_unsafe_single(ip)
 
 
-def validate_url(url):
+def validate_url(url, host_allowlist=ALLOWED_HOSTS):
     if not isinstance(url, str) or url == "":
         return None, "url must be a non-empty string"
 
@@ -294,21 +317,20 @@ def validate_url(url):
     if any(ord(c) < 0x21 or ord(c) == 0x7F for c in parts.netloc):
         return None, "control character in authority is not allowed"
 
-    # FIX: parts.username / parts.password are '' or None for a URL like
+    # parts.username / parts.password are '' or None for a URL like
     # "https://@www.iana.org/" (userinfo marker present but empty) -- both
-    # are FALSY, so `if username or password` silently passed this through
-    # even though it structurally contains userinfo syntax. Check for the
-    # literal '@' in the authority directly instead, which is unambiguous
-    # regardless of how urlsplit represents an empty username/password.
+    # are FALSY, so `if username or password` would silently pass this
+    # through even though it structurally contains userinfo syntax. Check
+    # for the literal '@' in the authority directly instead, which is
+    # unambiguous regardless of how urlsplit represents an empty
+    # username/password.
     if "@" in parts.netloc:
         return None, "userinfo in url is not allowed"
 
     # .hostname / .port are lazily-parsed properties on SplitResult and
     # can *each* raise ValueError on malformed input (e.g. bad IPv6
-    # literal, out-of-range port). The original code only guarded the
-    # urlsplit() call itself, so a malformed-but-scheme-valid URL could
-    # crash the endpoint with an unhandled 500 instead of returning a
-    # clean "block". Guard all of it.
+    # literal, out-of-range port). Guard both so a malformed-but-scheme-
+    # valid URL returns a clean "block" instead of an unhandled 500.
     try:
         host = parts.hostname
         port = parts.port
@@ -329,7 +351,7 @@ def validate_url(url):
     if port not in (None, 443):
         return None, "port not allowed"
 
-    if host not in ALLOWED_HOSTS:
+    if host not in host_allowlist:
         return None, f"host not allowlisted: {host}"
 
     try:
@@ -361,6 +383,7 @@ def validate_url(url):
 
 
 def do_fetch_url(url):
+    # Initial request: strict, exact ALLOWED_HOSTS only.
     validated, err = validate_url(url)
     if err:
         return "block", err, None
@@ -384,7 +407,12 @@ def do_fetch_url(url):
 
         if resp.status_code in (301, 302, 303, 307, 308) and "Location" in resp.headers:
             next_url = urljoin(current_url, resp.headers["Location"])
-            revalidated, rerr = validate_url(next_url)
+            # Redirect target: also permit the www./non-www. twin of an
+            # allowlisted host (see REDIRECT_ALLOWED_HOSTS comment above).
+            # Every other protection -- IP-literal, userinfo, backslash,
+            # control-char, and private/reserved-IP resolution checks --
+            # still applies in full.
+            revalidated, rerr = validate_url(next_url, host_allowlist=REDIRECT_ALLOWED_HOSTS)
             if rerr:
                 return "block", f"redirect blocked: {rerr}", None
             current_url = revalidated
