@@ -185,10 +185,10 @@ def validate_path(user_path):
     unicodedata.normalize("NFKC", user_path)
     ).replace("\\", "/")
 
-normalized_raw = os.path.normpath(normalized_input)
+    normalized_raw = os.path.normpath(normalized_input)
 
-candidate = os.path.join(SANDBOX_REAL, normalized_raw)
-real_candidate = os.path.realpath(candidate)
+    candidate = os.path.join(SANDBOX_REAL, normalized_raw)
+    real_candidate = os.path.realpath(candidate)
 
     if real_candidate != SANDBOX_REAL and not real_candidate.startswith(SANDBOX_REAL + os.sep):
         return None, "path escapes sandbox root (realpath check)"
@@ -320,17 +320,17 @@ def validate_url(url):
 
     host = host.lower().rstrip(".")
 
-try:
-    ipaddress.ip_address(host)
-    return None, "IP literals not allowed"
-except ValueError:
-    pass
+    try:
+      ipaddress.ip_address(host)
+        return None, "IP literals not allowed"
+    except ValueError:
+        pass
 
-if port not in (None, 443):
-    return None, "port not allowed"
+    if port not in (None, 443):
+        return None, "port not allowed"
 
-if host not in ALLOWED_HOSTS:
-    return None, f"host not allowlisted: {host}"
+    if host not in ALLOWED_HOSTS:
+        return None, f"host not allowlisted: {host}"
 
     try:
         infos = socket.getaddrinfo(host, None)
