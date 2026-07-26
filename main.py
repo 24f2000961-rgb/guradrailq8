@@ -181,9 +181,14 @@ def validate_path(user_path):
     # Only the ORIGINAL, undecoded string is used to touch the real
     # filesystem -- this is what keeps the benign encoded/backslash-ish
     # filenames resolvable while still blocking real traversal above.
-    normalized_raw = os.path.normpath(user_path)
-    candidate = os.path.join(SANDBOX_REAL, normalized_raw)
-    real_candidate = os.path.realpath(candidate)
+    normalized_input = _confusables_folded(
+    unicodedata.normalize("NFKC", user_path)
+).replace("\\", "/")
+
+normalized_raw = os.path.normpath(normalized_input)
+
+candidate = os.path.join(SANDBOX_REAL, normalized_raw)
+real_candidate = os.path.realpath(candidate)
 
     if real_candidate != SANDBOX_REAL and not real_candidate.startswith(SANDBOX_REAL + os.sep):
         return None, "path escapes sandbox root (realpath check)"
